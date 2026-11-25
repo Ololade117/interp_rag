@@ -1,84 +1,62 @@
-export type SectionKind = 'abstract' | 'results' | 'body';
+export type StorageBackend = 'pinecone' | 'memory';
 
-export interface PaperChunk {
+export interface RagConfigStatus {
+  geminiConfigured: boolean;
+  pineconeConfigured: boolean;
+  pineconeIndex: string | null;
+  pineconeDimension: number;
+  pineconeTotalRecords: number | null;
+  pineconeNamespaces: Record<string, number>;
+}
+
+export interface DocumentRecord {
   id: string;
-  paperId: string;
-  paperTitle: string;
-  section: SectionKind;
+  title: string;
+  sourceType: 'text' | 'txt' | 'md' | 'pdf';
+  backend: StorageBackend;
+  namespace: string;
+  chunkSize: number;
+  overlap: number;
+  dimensions: number;
+  chunkCount: number;
+  createdAt: string;
+}
+
+export interface StoredChunk {
+  id: string;
+  documentId: string;
+  documentTitle: string;
+  namespace: string;
   chunkIndex: number;
   text: string;
-  sparseWeights: Record<string, number>;
-  tokens: string[];
-  denseEmbedding?: number[];
+  embedding: number[];
 }
 
-export interface PaperRecord {
+export interface SearchSettings {
+  backend: StorageBackend;
+  namespace: string;
+  topK: number;
+  hybridAlpha: number; // 1.0 = pure vector, 0.0 = pure keyword, 0.7 = 70% vector + 30% keyword
+  minScore: number;
+  dimensions: number;
+  systemPrompt: string;
+}
+
+export interface RetrievedChunk {
   id: string;
-  arxivId?: string;
-  sourceUrl?: string;
-  filename: string;
-  title: string;
-  abstract: string;
-  results: string;
-  fullTextLength: number;
-  pageCount: number;
-  chunkCount: number;
-  ingestedAt: string;
-  embeddingReady: boolean;
+  documentId: string;
+  documentTitle: string;
+  chunkIndex: number;
+  text: string;
+  vectorScore: number;
+  keywordScore: number;
+  combinedScore: number;
 }
 
-export interface CuratedPaperEntry {
-  url: string;
-  arxivId?: string;
-  kind: 'arxiv_pdf' | 'html';
-  status: 'pending' | 'ingested' | 'skipped' | 'error';
-  paperId?: string;
-  title?: string;
-  message?: string;
-}
-
-export interface SparseTokenMatch {
-  token: string;
-  queryWeight: number;
-  docWeight: number;
-  contribution: number;
-}
-
-export interface PhraseMatch {
-  queryTerm: string;
-  matchedPhrase: string;
-  similarity: number;
-}
-
-export interface RetrievedChunkResult {
-  chunk: {
-    id: string;
-    paperId: string;
-    paperTitle: string;
-    section: SectionKind;
-    chunkIndex: number;
-    text: string;
-    topSparseTokens: Array<{ token: string; weight: number }>;
-  };
-  scores: {
-    dense: number | null;
-    sparse: number;
-    colbert: number;
-    hybrid: number;
-  };
-  sparseMatches: SparseTokenMatch[];
-  phraseMatches: PhraseMatch[];
-}
-
-export interface RagQueryRequest {
-  query: string;
-  topK?: number;
-  weights?: {
-    dense: number;
-    sparse: number;
-    colbert: number;
-  };
-  sectionFilter?: 'all' | 'abstract' | 'results';
-  useDenseEmbeddings?: boolean;
-  synthesizeAnswer?: boolean;
+export interface RagRunResult {
+  settings: SearchSettings;
+  answer: string | null;
+  answerError?: string;
+  chunks: RetrievedChunk[];
+  durationMs: number;
 }

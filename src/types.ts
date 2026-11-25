@@ -1,87 +1,55 @@
-export type SectionKind = 'abstract' | 'results' | 'body';
+export type StorageBackend = 'pinecone' | 'memory';
 
-export interface PaperRecord {
-  id: string;
-  arxivId?: string;
-  sourceUrl?: string;
-  filename: string;
-  title: string;
-  abstract: string;
-  results: string;
-  fullTextLength: number;
-  pageCount: number;
-  chunkCount: number;
-  ingestedAt: string;
-  embeddingReady: boolean;
+export interface RagConfigStatus {
+  geminiConfigured: boolean;
+  pineconeConfigured: boolean;
+  pineconeIndex: string | null;
+  pineconeDimension: number;
+  pineconeTotalRecords: number | null;
+  pineconeNamespaces: Record<string, number>;
 }
 
-export interface PaperChunkView {
+export interface DocumentRecord {
   id: string;
-  paperId: string;
-  paperTitle: string;
-  section: SectionKind;
+  title: string;
+  sourceType: 'text' | 'txt' | 'md' | 'pdf';
+  backend: StorageBackend;
+  namespace: string;
+  chunkSize: number;
+  overlap: number;
+  dimensions: number;
+  chunkCount: number;
+  createdAt: string;
+}
+
+export interface SearchSettings {
+  backend: StorageBackend;
+  namespace: string;
+  topK: number;
+  hybridAlpha: number;
+  minScore: number;
+  dimensions: number;
+  systemPrompt: string;
+}
+
+export interface RetrievedChunk {
+  id: string;
+  documentId: string;
+  documentTitle: string;
   chunkIndex: number;
   text: string;
-  sparseWeights: Record<string, number>;
+  vectorScore: number;
+  keywordScore: number;
+  combinedScore: number;
 }
 
-export interface CuratedPaperEntry {
-  url: string;
-  arxivId?: string;
-  kind: 'arxiv_pdf' | 'html';
-  status: 'pending' | 'ingested' | 'skipped' | 'error';
-  paperId?: string;
-  title?: string;
-  message?: string;
-}
-
-export interface CorpusStats {
-  totalPapers: number;
-  totalChunks: number;
-  embeddedChunks: number;
-  geminiConfigured: boolean;
-}
-
-export interface SparseTokenMatch {
-  token: string;
-  queryWeight: number;
-  docWeight: number;
-  contribution: number;
-}
-
-export interface PhraseMatch {
-  queryTerm: string;
-  matchedPhrase: string;
-  similarity: number;
-}
-
-export interface RetrievedChunkResult {
-  chunk: {
-    id: string;
-    paperId: string;
-    paperTitle: string;
-    section: SectionKind;
-    chunkIndex: number;
-    text: string;
-    topSparseTokens: Array<{ token: string; weight: number }>;
-  };
-  scores: {
-    dense: number | null;
-    sparse: number;
-    colbert: number;
-    hybrid: number;
-  };
-  sparseMatches: SparseTokenMatch[];
-  phraseMatches: PhraseMatch[];
-}
-
-export interface RagQueryResponse {
-  query: string;
-  results: RetrievedChunkResult[];
-  querySparseWeights: Record<string, number>;
-  denseActive: boolean;
-  denseError?: string;
+export interface RagRunResult {
+  settings: SearchSettings;
   answer: string | null;
-  synthesisError?: string;
-  stats: CorpusStats;
+  answerError?: string;
+  chunks: RetrievedChunk[];
+  durationMs: number;
 }
+
+export const DEFAULT_SYSTEM_PROMPT =
+  'You are a helpful research assistant. Answer the question using ONLY the provided context excerpts. Cite your sources inline like [Source 1] or [Title, Chunk #]. If the context does not contain enough information, say so clearly.';

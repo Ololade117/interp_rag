@@ -1,278 +1,290 @@
+import crypto from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import multer from 'multer';
-import { createServer as createViteServer } from 'vite';
-import { corpusStore } from './src/server/corpusStore.js';
-import { getGeminiClient } from './src/server/geminiClient.js';
-import { hybridSearch } from './src/server/retrieval.js';
-import type { RagQueryRequest } from './src/server/types.js';
+import {
+  DEFAULT_SYSTEM_PROMPT,
+  embedTexts,
+  extractTextFromPdf,
+  generateAnswer,
+  isGeminiConfigured,
+  splitIntoChunks,
+} from './src/server/rag.ts';
+import {
+  documentChunkIds,
+  getPineconeConfig,
+  getStore,
+  isPineconeConfigured,
+  pineconeStore,
+  sessionDocuments,
+} from './src/server/store.ts';
+import type {
+  DocumentRecord,
+  RagRunResult,
+  SearchSettings,
+  StorageBackend,
+  StoredChunk,
+} from './src/server/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+  limits: { fileSize: 20 * 1024 * 1024 },
 });
+
+function parseBackend(value: unknown): StorageBackend {
+  return value === 'pinecone' ? 'pinecone' : 'memory';
+}
+
+function parseSearchSettings(raw: Record<string, unknown>): SearchSettings {
+  const { dimension } = getPineconeConfig();
+  return {
+    backend: parseBackend(raw.backend),
+    namespace:
+      typeof raw.namespace === 'string' && raw.namespace.trim()
+        ? raw.namespace.trim()
+        : 'interp-rag',
+    topK:
+      typeof raw.topK === 'number'
+        ? Math.max(1, Math.min(20, Math.round(raw.topK)))
+        : 4,
+    hybridAlpha:
+      typeof raw.hybridAlpha === 'number'
+        ? Math.max(0, Math.min(1, raw.hybridAlpha))
+        : 0.75,
+    minScore:
+      typeof raw.minScore === 'number'
+        ? Math.max(0, Math.min(1, raw.minScore))
+        : 0,
+    dimensions:
+      typeof raw.dimensions === 'number' && raw.dimensions > 0
+        ? raw.dimensions
+        : dimension,
+    systemPrompt:
+      typeof raw.systemPrompt === 'string' && raw.systemPrompt.trim()
+        ? raw.systemPrompt.trim()
+        : DEFAULT_SYSTEM_PROMPT,
+  };
+}
+
+async function runSingleRag(
+  query: string,
+  settings: SearchSettings
+): Promise<RagRunResult> {
+  const start = Date.now();
+  const store = getStore(settings.backend);
+
+  const [queryEmbedding] = await embedTexts([query], settings.dimensions);
+
+  const chunks = await store.search({
+    query,
+    queryEmbedding,
+    namespace: settings.namespace,
+    topK: settings.topK,
+    hybridAlpha: settings.hybridAlpha,
+    minScore: settings.minScore,
+  });
+
+  let answer: string | null = null;
+  let answerError: string | undefined;
+
+  try {
+    answer = await generateAnswer(query, chunks, settings.systemPrompt);
+  } catch (err) {
+    answerError =
+      err instanceof Error ? err.message : 'Failed to generate answer.';
+  }
+
+  return {
+    settings,
+    answer,
+    answerError,
+    chunks,
+    durationMs: Date.now() - start,
+  };
+}
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '4mb' }));
+  app.use(express.json({ limit: '5mb' }));
 
-  // 1. Corpus overview
-  app.get('/api/corpus', (_req, res) => {
-    res.json({
-      papers: corpusStore.papers,
-      curatedQueue: corpusStore.curatedQueue,
-      stats: corpusStore.getStats(),
-    });
-  });
-
-  // 2. Single paper detail (extracted Title, Abstract, Results, Chunks)
-  app.get('/api/papers/:id', (req, res) => {
-    const detail = corpusStore.getPaper(req.params.id);
-    if (!detail) {
-      res.status(404).json({ error: 'Paper not found' });
-      return;
-    }
-    res.json(detail);
-  });
-
-  // 3. Delete paper
-  app.delete('/api/papers/:id', (req, res) => {
-    const deleted = corpusStore.deletePaper(req.params.id);
-    if (!deleted) {
-      res.status(404).json({ error: 'Paper not found' });
-      return;
-    }
-    res.json({ deleted: true, stats: corpusStore.getStats() });
-  });
-
-  // 4. Ingest single arXiv ID / URL or HTML URL
-  app.post('/api/papers/ingest-url', async (req, res) => {
-    const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
-    const allowHtml = req.body?.allowHtml !== false;
-    if (!url) {
-      res.status(400).json({ error: 'Provide an arXiv ID or paper URL.' });
-      return;
-    }
-
-    const result = await corpusStore.ingestFromUrl(url, { allowHtml });
-    if (!result.ok && !result.skipped) {
-      res.status(422).json({
-        error: result.message,
-        curatedQueue: corpusStore.curatedQueue,
-        stats: corpusStore.getStats(),
-      });
-      return;
-    }
+  // 1. Health & configuration status (never exposes secrets)
+  app.get('/api/status', async (_req, res) => {
+    const pineconeCfg = getPineconeConfig();
+    const pineconeStats = await pineconeStore.describeStats();
 
     res.json({
-      ...result,
-      papers: corpusStore.papers,
-      curatedQueue: corpusStore.curatedQueue,
-      stats: corpusStore.getStats(),
+      geminiConfigured: isGeminiConfigured(),
+      pineconeConfigured: isPineconeConfigured(),
+      pineconeIndex: pineconeCfg.indexName || null,
+      pineconeDimension: pineconeCfg.dimension,
+      pineconeTotalRecords: pineconeStats?.totalRecords ?? null,
+      pineconeNamespaces: pineconeStats?.namespaces ?? {},
     });
   });
 
-  // 5. Sync batch of curated papers from download_papers.py list
-  app.post('/api/papers/sync-curated', async (req, res) => {
-    const limit = typeof req.body?.limit === 'number' ? Math.max(1, Math.min(20, req.body.limit)) : 5;
-    const includeHtml = req.body?.includeHtml === true;
-    const targetUrls: string[] | undefined = Array.isArray(req.body?.urls)
-      ? req.body.urls
-      : undefined;
-
-    const candidates = corpusStore.curatedQueue.filter((entry) => {
-      if (targetUrls) return targetUrls.includes(entry.url);
-      if (entry.status === 'ingested') return false;
-      if (!includeHtml && entry.kind === 'html') return false;
-      return true;
-    });
-
-    const batch = candidates.slice(0, limit);
-    const outcomes: Array<{ url: string; ok: boolean; skipped?: boolean; message: string }> = [];
-
-    for (const entry of batch) {
-      const outcome = await corpusStore.ingestFromUrl(entry.url, { allowHtml: includeHtml });
-      outcomes.push({
-        url: entry.url,
-        ok: outcome.ok,
-        skipped: outcome.skipped,
-        message: outcome.message,
-      });
-    }
-
-    res.json({
-      processed: outcomes.length,
-      outcomes,
-      papers: corpusStore.papers,
-      curatedQueue: corpusStore.curatedQueue,
-      stats: corpusStore.getStats(),
-    });
+  // 2. List documents added in this session
+  app.get('/api/documents', (_req, res) => {
+    res.json({ documents: sessionDocuments });
   });
 
-  // 6. Upload local PDF file
-  app.post('/api/papers/upload', upload.single('file'), async (req, res) => {
-    if (!req.file) {
-      res.status(400).json({ error: 'No PDF file uploaded.' });
-      return;
-    }
-
-    if (
-      !req.file.originalname.toLowerCase().endsWith('.pdf') &&
-      !req.file.mimetype.includes('pdf')
-    ) {
-      res.status(400).json({ error: 'Uploaded file must be a PDF document.' });
-      return;
-    }
-
+  // 3. Add a document (supports pasted text or uploaded .txt, .md, .pdf)
+  app.post('/api/documents', upload.single('file'), async (req, res) => {
     try {
-      const paper = await corpusStore.ingestPdfBuffer(
-        new Uint8Array(req.file.buffer),
-        req.file.originalname
-      );
-      res.json({
-        paper,
-        papers: corpusStore.papers,
-        stats: corpusStore.getStats(),
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to parse PDF document.';
-      res.status(422).json({ error: msg });
-    }
-  });
+      const body = req.body as Record<string, unknown>;
+      const backend = parseBackend(body.backend);
+      const namespace =
+        typeof body.namespace === 'string' && body.namespace.trim()
+          ? body.namespace.trim()
+          : 'interp-rag';
+      const chunkSize = Number(body.chunkSize) || 600;
+      const overlap = Number(body.overlap) || 100;
+      const dimensions = Number(body.dimensions) || getPineconeConfig().dimension;
 
-  // 7. Add custom paper text (Title, Abstract, Results)
-  app.post('/api/papers/manual', (req, res) => {
-    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
-    const abstract = typeof req.body?.abstract === 'string' ? req.body.abstract.trim() : '';
-    const results = typeof req.body?.results === 'string' ? req.body.results.trim() : '';
-    const sourceUrl = typeof req.body?.sourceUrl === 'string' ? req.body.sourceUrl.trim() : '';
+      let title = typeof body.title === 'string' ? body.title.trim() : '';
+      let rawText = typeof body.text === 'string' ? body.text.trim() : '';
+      let sourceType: DocumentRecord['sourceType'] = 'text';
 
-    if (!title || (!abstract && !results)) {
-      res.status(400).json({ error: 'Provide a paper title and at least an abstract or results text.' });
-      return;
-    }
+      if (req.file) {
+        const nameLower = req.file.originalname.toLowerCase();
+        if (!title) {
+          title = req.file.originalname.replace(/\.[^.]+$/, '');
+        }
+        if (nameLower.endsWith('.pdf') || req.file.mimetype.includes('pdf')) {
+          sourceType = 'pdf';
+          rawText = await extractTextFromPdf(new Uint8Array(req.file.buffer));
+        } else if (nameLower.endsWith('.md')) {
+          sourceType = 'md';
+          rawText = req.file.buffer.toString('utf-8');
+        } else {
+          sourceType = 'txt';
+          rawText = req.file.buffer.toString('utf-8');
+        }
+      }
 
-    const paper = corpusStore.ingestManualPaper({ title, abstract, results, sourceUrl });
-    res.json({
-      paper,
-      papers: corpusStore.papers,
-      stats: corpusStore.getStats(),
-    });
-  });
-
-  // 8. Compute Gemini dense embeddings for all unembedded chunks
-  app.post('/api/papers/embed', async (_req, res) => {
-    try {
-      const result = await corpusStore.embedAllMissing();
-      if (result.error) {
+      if (!title || !rawText) {
         res.status(400).json({
-          error: result.error,
-          stats: corpusStore.getStats(),
+          error: 'Please provide both a document title and text (or upload a file).',
         });
         return;
       }
 
-      res.json({
-        embeddedCount: result.embeddedCount,
-        papers: corpusStore.papers,
-        stats: corpusStore.getStats(),
-      });
+      const pieces = splitIntoChunks(rawText, chunkSize, overlap);
+      if (pieces.length === 0) {
+        res.status(400).json({ error: 'No readable text could be extracted.' });
+        return;
+      }
+
+      const embeddings = await embedTexts(pieces, dimensions);
+      const documentId = crypto.randomUUID();
+
+      const storedChunks: StoredChunk[] = pieces.map((text, idx) => ({
+        id: `${documentId}_chunk_${idx}`,
+        documentId,
+        documentTitle: title,
+        namespace,
+        chunkIndex: idx,
+        text,
+        embedding: embeddings[idx],
+      }));
+
+      const store = getStore(backend);
+      await store.saveChunks(storedChunks);
+
+      const doc: DocumentRecord = {
+        id: documentId,
+        title,
+        sourceType,
+        backend,
+        namespace,
+        chunkSize,
+        overlap,
+        dimensions,
+        chunkCount: storedChunks.length,
+        createdAt: new Date().toISOString(),
+      };
+
+      sessionDocuments.unshift(doc);
+      documentChunkIds.set(
+        documentId,
+        storedChunks.map((c) => c.id)
+      );
+
+      res.json({ document: doc });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to generate embeddings.';
-      res.status(500).json({ error: msg, stats: corpusStore.getStats() });
+      const msg = err instanceof Error ? err.message : 'Failed to ingest document.';
+      res.status(500).json({ error: msg });
     }
   });
 
-  // 9. Hybrid RAG Query (Dense + Sparse + Multi-Vector MaxSim + Gemini Synthesis)
-  app.post('/api/rag/query', async (req, res) => {
-    const body = (req.body ?? {}) as Partial<RagQueryRequest>;
-    const query = typeof body.query === 'string' ? body.query.trim() : '';
+  // 4. Delete a document and its chunks from the store
+  app.delete('/api/documents/:id', async (req, res) => {
+    const docId = req.params.id;
+    const idx = sessionDocuments.findIndex((d) => d.id === docId);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Document not found in current session.' });
+      return;
+    }
+
+    const doc = sessionDocuments[idx];
+    const chunkIds = documentChunkIds.get(docId) ?? [];
+
+    try {
+      const store = getStore(doc.backend);
+      await store.deleteDocument(docId, doc.namespace, chunkIds);
+      sessionDocuments.splice(idx, 1);
+      documentChunkIds.delete(docId);
+      res.json({ deleted: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to delete document.';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  // 5. Run a single RAG query
+  app.post('/api/query', async (req, res) => {
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
     if (!query) {
-      res.status(400).json({ error: 'Query cannot be empty.' });
+      res.status(400).json({ error: 'Please enter a question.' });
       return;
     }
 
-    if (corpusStore.chunks.length === 0) {
-      res.status(400).json({
-        error: 'The corpus is empty. Ingest at least one paper from the arXiv queue or upload a PDF first.',
-      });
+    try {
+      const settings = parseSearchSettings((req.body?.settings ?? {}) as Record<string, unknown>);
+      const result = await runSingleRag(query, settings);
+      res.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Query failed.';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  // 6. Run two RAG configurations side-by-side on the same question (Option 3)
+  app.post('/api/compare', async (req, res) => {
+    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+    if (!query) {
+      res.status(400).json({ error: 'Please enter a question to compare.' });
       return;
     }
 
-    const topK = typeof body.topK === 'number' ? Math.max(1, Math.min(12, body.topK)) : 5;
-    const weights = {
-      dense: typeof body.weights?.dense === 'number' ? Math.max(0, body.weights.dense) : 0.45,
-      sparse: typeof body.weights?.sparse === 'number' ? Math.max(0, body.weights.sparse) : 0.3,
-      colbert: typeof body.weights?.colbert === 'number' ? Math.max(0, body.weights.colbert) : 0.25,
-    };
-    const sectionFilter =
-      body.sectionFilter === 'abstract' || body.sectionFilter === 'results'
-        ? body.sectionFilter
-        : 'all';
-    const useDenseEmbeddings = body.useDenseEmbeddings !== false;
-    const synthesizeAnswer = body.synthesizeAnswer !== false;
+    try {
+      const configA = parseSearchSettings((req.body?.configA ?? {}) as Record<string, unknown>);
+      const configB = parseSearchSettings((req.body?.configB ?? {}) as Record<string, unknown>);
 
-    const retrieval = await hybridSearch({
-      query,
-      chunks: corpusStore.chunks,
-      topK,
-      weights,
-      sectionFilter,
-      useDenseEmbeddings,
-    });
+      const [resultA, resultB] = await Promise.all([
+        runSingleRag(query, configA),
+        runSingleRag(query, configB),
+      ]);
 
-    // Update paper embedding flags if dense embeddings were populated during search
-    for (const paper of corpusStore.papers) {
-      const paperChunks = corpusStore.chunks.filter((c) => c.paperId === paper.id);
-      paper.embeddingReady =
-        paperChunks.length > 0 &&
-        paperChunks.every((c) => Array.isArray(c.denseEmbedding) && c.denseEmbedding.length > 0);
+      res.json({ query, resultA, resultB });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Comparison failed.';
+      res.status(500).json({ error: msg });
     }
-
-    let answer: string | null = null;
-    let synthesisError: string | undefined;
-
-    if (synthesizeAnswer && retrieval.results.length > 0) {
-      try {
-        const ai = getGeminiClient();
-        const contextBlocks = retrieval.results
-          .map(
-            (r, idx) =>
-              `[Source ${idx + 1}] Title: ${r.chunk.paperTitle} | Section: ${r.chunk.section.toUpperCase()} | Hybrid Score: ${r.scores.hybrid.toFixed(3)}\n${r.chunk.text}`
-          )
-          .join('\n\n---\n\n');
-
-        const response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Research Question:\n${query}\n\nRetrieved Mechanistic Interpretability Excerpts:\n${contextBlocks}`,
-          config: {
-            systemInstruction:
-              'You are a mechanistic interpretability research assistant. Answer the research question strictly using the provided retrieved paper excerpts. Cite specific papers inline using [Source N] or [Paper Title · Section] notation. If the excerpts do not contain enough evidence to answer part of the question, state that clearly rather than extrapolating.',
-          },
-        });
-
-        answer = response.text ?? '';
-      } catch (err) {
-        synthesisError =
-          err instanceof Error ? err.message : 'Failed to generate grounded RAG response.';
-      }
-    }
-
-    res.json({
-      query,
-      results: retrieval.results,
-      querySparseWeights: retrieval.querySparseWeights,
-      denseActive: retrieval.denseActive,
-      denseError: retrieval.denseError,
-      answer,
-      synthesisError,
-      stats: corpusStore.getStats(),
-    });
   });
 
   const httpServer = http.createServer(app);
@@ -280,6 +292,7 @@ async function startServer() {
   // Mount Vite middleware in development, or serve static dist in production
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -292,7 +305,7 @@ async function startServer() {
   } else {
     const distDir = path.join(__dirname, 'dist');
     app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
+    app.use((_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
@@ -304,6 +317,6 @@ async function startServer() {
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start InterpRAG server:', err);
+  console.error('Failed to start server:', err);
   process.exit(1);
 });
