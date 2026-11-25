@@ -1,0 +1,8 @@
+{
+  "name": "InterpRAG",
+  "description": "Mechanistic Interpretability research RAG workbench with PDF section extraction and hybrid dense, sparse, and multi-vector retrieval.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
